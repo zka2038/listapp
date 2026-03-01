@@ -1,10 +1,33 @@
+// src/AppleLikeListApp.jsx
 import React, { useEffect, useRef, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 
-// Apple-like, smooth single-file React component
-// Tailwind CSS assumed. Copy into your app (e.g. Vite + React + Tailwind).
-// Collaboration: optional WebSocket server. If you provide wsUrl, the component will connect and sync list state.
+/**
+ * Single-file Apple-like multi-column collaborative list using Supabase Realtime.
+ *
+ * Save as src/AppleLikeListApp.jsx
+ *
+ * Requirements:
+ *   npm install @supabase/supabase-js
+ *   VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY set in your environment (Netlify or .env)
+ *
+ * Behavior:
+ *  - Stores the list in Supabase table `lists` row id='default' (jsonb items).
+ *  - Subscribes to changes and syncs in realtime.
+ *  - Falls back to localStorage while loading.
+ *  - Supports add, remove, drag/reorder, export .txt, and multi-column layout.
+ */
 
-export default function AppleLikeListApp({ wsUrl = null }) {
+// Initialize Supabase client from Vite env vars
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+const supabase =
+  supabaseUrl && supabaseAnonKey
+    ? createClient(supabaseUrl, supabaseAnonKey)
+    : null;
+
+export default function AppleLikeListApp() {
   const [items, setItems] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem("apple_list_items")) || [];
@@ -15,63 +38,105 @@ export default function AppleLikeListApp({ wsUrl = null }) {
   const [text, setText] = useState("");
   const [dragIndex, setDragIndex] = useState(null);
   const listRef = useRef(null);
-  const clientIdRef = useRef(() => Math.random().toString(36).slice(2));
-  const wsRef = useRef(null);
+  const isMounted = useRef(true);
 
   // Persist to localStorage
   useEffect(() => {
     localStorage.setItem("apple_list_items", JSON.stringify(items));
   }, [items]);
 
-  // WebSocket collaboration
+  // Supabase: load initial state & subscribe to realtime updates
   useEffect(() => {
-    if (!wsUrl) return;
-    try {
-      wsRef.current = new WebSocket(wsUrl);
-    } catch (e) {
-      console.warn("Invalid wsUrl", e);
-      return;
+    isMounted.current = true;
+    if (!supabase) {
+      console.warn("Supabase not configured (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).");
+      return () => {
+        isMounted.current = false;
+      };
     }
-    const ws = wsRef.current;
-    ws.onopen = () => {
-      // announce and request state
-      ws.send(JSON.stringify({ type: "hello", client: clientIdRef.current }));
-      ws.send(JSON.stringify({ type: "request_state", client: clientIdRef.current }));
-    };
-    ws.onmessage = (ev) => {
+
+    let channel = null;
+    let mounted = true;
+
+    const load = async () => {
+      // Try to load row id='default'
       try {
-        const msg = JSON.parse(ev.data);
-        if (msg.client === clientIdRef.current) return; // ignore our own
-        if (msg.type === "state") {
-          // Replace for simple sync (could do smarter merge)
-          if (Array.isArray(msg.items)) {
-            setItems(msg.items);
-          }
-        } else if (msg.type === "patch") {
-          // apply patch (simple replace or add)
-          if (Array.isArray(msg.items)) setItems(msg.items);
+        const { data, error } = await supabase
+          .from("lists")
+          .select("items")
+          .eq("id", "default")
+          .single();
+
+        if (error && error.code !== "PGRST116") {
+          // PGRST116: no rows returned may be driver-specific - ignore if empty
+          console.error("Supabase load error:", error);
+        } else if (data && mounted) {
+          const loadedItems = Array.isArray(data.items) ? data.items : [];
+          setItems(loadedItems);
+        } else {
+          // If no data, keep localStorage fallback (already set in initial state)
         }
-      } catch (e) {
-        console.warn("bad message", e);
+      } catch (err) {
+        console.error("Error loading from supabase:", err);
       }
     };
-    ws.onclose = () => {
-      console.info("ws closed");
-    };
-    return () => {
-      ws.close();
-    };
-  }, [wsUrl]);
 
-  // Broadcast state to collaborators
-  const broadcastState = (newItems) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({ type: "state", client: clientIdRef.current, items: newItems })
-      );
+    load();
+
+    // Subscribe to changes on the 'lists' table for row id='default'
+    try {
+      channel = supabase
+        .channel("public:lists")
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "lists", filter: "id=eq.default" },
+          (payload) => {
+            // payload.new contains the updated row
+            const newItems = payload?.new?.items;
+            if (Array.isArray(newItems) && isMounted.current) {
+              setItems(newItems);
+            }
+          }
+        )
+        .subscribe((status) => {
+          // optional: debug subscription status
+          // console.log("supabase subscription status:", status);
+        });
+    } catch (err) {
+      console.error("Supabase subscription error:", err);
+    }
+
+    return () => {
+      mounted = false;
+      isMounted.current = false;
+      if (channel) {
+        try {
+          supabase.removeChannel(channel);
+        } catch (err) {
+          // ignore
+        }
+      }
+    };
+  }, []);
+
+  // Upsert the list row in Supabase (broadcast)
+  const broadcastState = async (newItems) => {
+    if (!supabase) return;
+    try {
+      const { error } = await supabase.from("lists").upsert({
+        id: "default",
+        items: newItems,
+        updated_at: new Date().toISOString(),
+      });
+      if (error) {
+        console.error("Supabase upsert error:", error);
+      }
+    } catch (err) {
+      console.error("Supabase upsert exception:", err);
     }
   };
 
+  // Add item
   const addItem = (t) => {
     if (!t || !t.trim()) return;
     const newItems = [...items, t.trim()];
@@ -80,6 +145,7 @@ export default function AppleLikeListApp({ wsUrl = null }) {
     setText("");
   };
 
+  // Remove item by index
   const removeItem = (i) => {
     const newItems = items.filter((_, idx) => idx !== i);
     setItems(newItems);
@@ -102,8 +168,9 @@ export default function AppleLikeListApp({ wsUrl = null }) {
 
   const onDrop = (e, idx) => {
     e.preventDefault();
-    const from = dragIndex !== null ? dragIndex : Number(e.dataTransfer.getData("text/plain"));
-    let to = idx;
+    const from =
+      dragIndex !== null ? dragIndex : Number(e.dataTransfer.getData("text/plain"));
+    const to = idx;
     if (from === to) return setDragIndex(null);
     const newItems = [...items];
     const [m] = newItems.splice(from, 1);
@@ -134,7 +201,6 @@ export default function AppleLikeListApp({ wsUrl = null }) {
     }
   };
 
-  // UI helpers
   const placeholder = "Add something awesome...";
 
   return (
@@ -143,7 +209,9 @@ export default function AppleLikeListApp({ wsUrl = null }) {
         <header className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-3xl font-semibold leading-tight">My Smooth List</h1>
-            <p className="text-sm text-slate-500">Add items, drag to reorder, export .txt, and collaborate.</p>
+            <p className="text-sm text-slate-500">
+              Add items, drag to reorder, export .txt, and collaborate.
+            </p>
           </div>
           <div className="flex gap-2 items-center">
             <button
@@ -186,14 +254,12 @@ export default function AppleLikeListApp({ wsUrl = null }) {
           ref={listRef}
           className="p-6 rounded-3xl bg-white/90 border border-slate-100 shadow-lg"
           style={{
-            // CSS multi-column layout: when vertical space fills, items flow into a new column automatically
             columnWidth: 260,
             columnGap: "24px",
             maxHeight: "60vh",
             overflow: "auto",
           }}
         >
-          {/* Items need to be inline-block to avoid being split across columns */}
           {items.map((it, idx) => (
             <div
               key={it + idx}
@@ -201,7 +267,7 @@ export default function AppleLikeListApp({ wsUrl = null }) {
               onDragStart={(e) => onDragStart(e, idx)}
               onDragOver={(e) => onDragOver(e, idx)}
               onDrop={(e) => onDrop(e, idx)}
-              className={`inline-block w-60 align-top mb-4 mr-4 rounded-xl p-3 border border-slate-100 shadow-sm transform transition hover:scale-101 cursor-grab bg-gradient-to-b from-white to-slate-50`}
+              className="inline-block w-60 align-top mb-4 mr-4 rounded-xl p-3 border border-slate-100 shadow-sm transform transition hover:scale-101 cursor-grab bg-gradient-to-b from-white to-slate-50"
               style={{ breakInside: "avoid" }}
             >
               <div className="flex items-start justify-between gap-2">
@@ -221,15 +287,18 @@ export default function AppleLikeListApp({ wsUrl = null }) {
             </div>
           ))}
 
-          {/* empty state */}
           {items.length === 0 && (
             <div className="text-center text-slate-400 py-20">Your list is empty — add something ✨</div>
           )}
         </div>
 
         <footer className="mt-4 text-xs text-slate-500">
-          <div>Collaboration: {wsUrl ? "connected to provided websocket" : "disabled (no wsUrl)"}.</div>
-          <div className="mt-1">Tip: Use a tiny WebSocket server that relays messages (or a simple Socket.io server) to enable real-time sync.</div>
+          <div>
+            Collaboration: {supabase ? "connected via Supabase" : "disabled (Supabase not configured)"}.
+          </div>
+          <div className="mt-1">
+            Tip: set <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> in Netlify's environment variables.
+          </div>
         </footer>
       </div>
     </div>
